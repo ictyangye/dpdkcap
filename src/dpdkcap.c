@@ -273,21 +273,20 @@ static int port_init(
   struct rte_eth_dev_info dev_info;
   int retval;
   uint16_t q;
+  uint16_t dev_count;
 
   /* Check if the port id is valid */
 #if RTE_VERSION >= RTE_VERSION_NUM(18,11,3,16)
+  dev_count = rte_eth_dev_count_avail()-1;
+#else
+  dev_count = rte_eth_dev_count()-1;
+#endif
+
   if(rte_eth_dev_is_valid_port(port)==0) {
      RTE_LOG(ERR, DPDKCAP, "Port identifier %d out of range (0 to %d) or not"\
-       " attached.\n", port, rte_eth_dev_count_avail()-1);
+       " attached.\n", port, dev_count);
     return -EINVAL;
   }
-#else
-  if(rte_eth_dev_is_valid_port(port)==0) {
-    RTE_LOG(ERR, DPDKCAP, "Port identifier %d out of range (0 to %d) or not"\
-       " attached.\n", port, rte_eth_dev_count()-1);
-    return -EINVAL;
-  }
-#endif
 
   /* Get the device info */
   rte_eth_dev_info_get(port, &dev_info);
@@ -392,6 +391,7 @@ int main(int argc, char *argv[]) {
   unsigned int required_cores;
   unsigned int core_index;
   int result;
+  uint16_t dev_count;
   FILE * log_file;
 
   /* Initialize the Environment Abstraction Layer (EAL). */
@@ -461,42 +461,29 @@ int main(int argc, char *argv[]) {
 
   /* Check if at least one port is available */
 #if RTE_VERSION >= RTE_VERSION_NUM(18,11,3,16)
-  if (rte_eth_dev_count_avail() == 0)
-    rte_exit(EXIT_FAILURE, "Error: No port available.\n");
+  dev_count=rte_eth_dev_count_avail();
 #else
-  if (rte_eth_dev_count() == 0)
-    rte_exit(EXIT_FAILURE, "Error: No port available.\n");
+  dev_count=rte_eth_dev_count();
 #endif
 
+  if (dev_count == 0)
+    rte_exit(EXIT_FAILURE, "Error: No port available.\n");
+
   /* Fills in the number of rx descriptors matrix */
-#if RTE_VERSION >= RTE_VERSION_NUM(18,11,3,16)
-  unsigned long * num_rx_desc_matrix = calloc(rte_eth_dev_count_avail(), sizeof(int));
+  unsigned long * num_rx_desc_matrix = calloc(dev_count, sizeof(int));
   if (arguments.num_rx_desc_str_matrix != NULL &&
       parse_matrix_opt(arguments.num_rx_desc_str_matrix,                        
-        num_rx_desc_matrix, rte_eth_dev_count_avail()) < 0) {
+        num_rx_desc_matrix, dev_count) < 0) {
     rte_exit(EXIT_FAILURE, "Invalid RX descriptors matrix.\n");                 
   }
-#else
-  unsigned long * num_rx_desc_matrix = calloc(rte_eth_dev_count(), sizeof(int));
-  if (arguments.num_rx_desc_str_matrix != NULL &&
-      parse_matrix_opt(arguments.num_rx_desc_str_matrix,
-        num_rx_desc_matrix, rte_eth_dev_count()) < 0) {
-    rte_exit(EXIT_FAILURE, "Invalid RX descriptors matrix.\n");
-  }
-#endif
 
   /* Creates the port list */
   nb_ports = 0;
   for (i = 0; i < 64; i++) {
     if (! ((uint64_t)(1ULL << i) & arguments.portmask))
       continue;
-#if RTE_VERSION >= RTE_VERSION_NUM(18,11,3,16)
-    if (i<rte_eth_dev_count_avail())
+    if (i<dev_count)
       portlist[nb_ports++] = i;
-#else
-    if (i<rte_eth_dev_count())
-      portlist[nb_ports++] = i;
-#endif
     else
       RTE_LOG(WARNING, DPDKCAP, "Warning: port %d is in portmask, " \
           "but not enough ports are available. Ignoring...\n", i);
