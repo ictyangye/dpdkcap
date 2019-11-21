@@ -4,7 +4,7 @@ addons:
     packages:
     - libncurses-dev
     - linux-headers-4.15.0-58-generic
-    - libnum-dev
+    - libnuma-dev
 
 cache:
   directories:
