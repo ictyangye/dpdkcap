@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <argp.h>
+#include <stdio.h>
 #include <inttypes.h>
 
 #include <rte_common.h>
@@ -12,6 +13,7 @@
 #include <rte_string_fns.h>
 #include <rte_version.h>
 
+#include "utils.h"
 #include "pcap.h"
 #include "core_write.h"
 #include "core_capture.h"
@@ -27,8 +29,9 @@
 
 #define MAX_LCORES 1000
 
-#define DPDKCAP_OUTPUT_TEMPLATE_TOKEN_FILECOUNT "\%FCOUNT"
-#define DPDKCAP_OUTPUT_TEMPLATE_TOKEN_CORE_ID   "\%COREID"
+#define DPDKCAP_OUTPUT_TEMPLATE_TOKEN_FILECOUNT "FCOUNT"
+#define DPDKCAP_OUTPUT_TEMPLATE_TOKEN_PORT_ID   "portPORTID"
+#define DPDKCAP_OUTPUT_TEMPLATE_TOKEN_CORE_ID   "coreCOREID"
 #define DPDKCAP_OUTPUT_TEMPLATE_DEFAULT "output_" \
   DPDKCAP_OUTPUT_TEMPLATE_TOKEN_CORE_ID
 
@@ -83,6 +86,7 @@ static struct argp_option options[] = {
       "Use \""DPDKCAP_OUTPUT_TEMPLATE_TOKEN_FILECOUNT"\" within the output "\
       "file template to index each new file.", 0},
   { "portmask", 'p', "PORTMASK", 0, "Ethernet ports mask (default: 0x1).", 0 },
+  { "packet length captured", 'l', "pktlength", 0, "Packet length stripped (default: 100Byte).", 0 },
   { "snaplen", 's', "LENGTH", 0, "Snap the capture to snaplen bytes "\
     "(default: 65535).", 0 },
   { "logs", 700, "FILE", 0, "Writes the logs into FILE instead of "\
@@ -98,12 +102,14 @@ struct arguments {
   unsigned long nb_mbufs;
   char * num_rx_desc_str_matrix;
   unsigned long per_port_c_cores;
-  unsigned long num_w_cores;
+  unsigned long per_port_w_cores;
+  //unsigned long num_w_cores;
   int no_compression;
   unsigned long snaplen;
   unsigned long rotate_seconds;
   uint64_t file_size_limit;
   char * log_file;
+  unsigned int pktlength;
 };
 
 static int parse_matrix_opt(char * arg, unsigned long * matrix,
@@ -213,10 +219,13 @@ static error_t parse_opt(int key, char* arg, struct argp_state *state) {
       arguments->per_port_c_cores = strtoul(arg, &end, 10);
       break;
     case 'w':
-      arguments->num_w_cores = strtoul(arg, &end, 10);
+      arguments->per_port_w_cores = strtoul(arg, &end, 10);
       break;
     case 's':
       arguments->snaplen = strtoul(arg, &end, 10);
+      break;
+    case 'l':
+      arguments->pktlength = strtoul(arg, &end, 10);
       break;
     case 'G':
       arguments->rotate_seconds = strtoul(arg, &end, 10);
@@ -242,7 +251,7 @@ static error_t parse_opt(int key, char* arg, struct argp_state *state) {
 static struct argp argp = { options, parse_opt, args_doc, doc, 0, 0, 0 };
 /* END OF ARGP */
 
-static struct rte_ring *write_ring;
+static struct rte_ring *write_ring[2];
 
 struct arguments arguments;
 
@@ -385,7 +394,7 @@ int main(int argc, char *argv[]) {
   struct core_write_config   * cores_config_write_list;
   unsigned int lcoreid_list[MAX_LCORES];
   unsigned int nb_lcores;
-  struct rte_mempool *mbuf_pool;
+  struct rte_mempool *mbuf_pool[2];
   unsigned int port_id;
   unsigned int i,j;
   unsigned int required_cores;
@@ -409,13 +418,14 @@ int main(int argc, char *argv[]) {
       .nb_mbufs = NUM_MBUFS_DEFAULT,
       .num_rx_desc_str_matrix = NULL,
       .per_port_c_cores = 1,
-      .num_w_cores = 1,
+      .per_port_w_cores = 1,
       .no_compression = 0,
       .snaplen = PCAP_SNAPLEN_DEFAULT,
       .portmask = 0x1,
       .rotate_seconds = 0,
       .file_size_limit = 0,
       .log_file=NULL,
+      .pktlength=100,
   };
   strncpy(arguments.output_file_template, DPDKCAP_OUTPUT_TEMPLATE_DEFAULT,
       DPDKCAP_OUTPUT_FILENAME_LENGTH);
@@ -444,6 +454,10 @@ int main(int argc, char *argv[]) {
   }
 
   /* Add suffixes to output if needed */
+  if (!strstr(arguments.output_file_template,
+        DPDKCAP_OUTPUT_TEMPLATE_TOKEN_PORT_ID))
+    strcat(arguments.output_file_template,
+        "_"DPDKCAP_OUTPUT_TEMPLATE_TOKEN_PORT_ID);
   if (!strstr(arguments.output_file_template,
         DPDKCAP_OUTPUT_TEMPLATE_TOKEN_CORE_ID))
     strcat(arguments.output_file_template,
@@ -495,7 +509,7 @@ int main(int argc, char *argv[]) {
   RTE_LOG(INFO,DPDKCAP,"Using %u ports to listen on\n", nb_ports);
 
   /* Checks core number */
-  required_cores=(1+nb_ports*arguments.per_port_c_cores+arguments.num_w_cores);
+  required_cores=(1+nb_ports*arguments.per_port_c_cores+nb_ports*arguments.per_port_w_cores);
   if (rte_lcore_count() < required_cores) {
     rte_exit(EXIT_FAILURE, "Assign at least %d cores to dpdkcap.\n",
         required_cores);
@@ -504,42 +518,110 @@ int main(int argc, char *argv[]) {
       required_cores, rte_lcore_count());
 
 
+  RTE_LOG(INFO, DPDKCAP, "THIS IS %d\n", rte_eal_process_type());
   /* Creates a new mempool in memory to hold the mbufs. */
-  mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", arguments.nb_mbufs,
-      MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  char temp1[50];
+  char temp2[50];
+  char temp3[5];
+  for (i = 0; i < nb_ports; i++) {
+	strcpy(temp1, "MBUF_POOL_P_portid");
+	strcpy(temp2, "Ring_for_writing_PRIMARY_portid");
+	snprintf(temp3, 5, "%02d", i);
+	while(str_replace(temp1,"portid",temp3));
+  	if(rte_eal_process_type() == RTE_PROC_PRIMARY){
+    	mbuf_pool[i] = rte_pktmbuf_pool_create(temp1, arguments.nb_mbufs,
+      	MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 
-  if (mbuf_pool == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+    	RTE_LOG(INFO, DPDKCAP, "THIS IS PRIMARY\n");
+  	}
+ 
+  	if(rte_eal_process_type() ==RTE_PROC_SECONDARY){
+    	mbuf_pool[i] = rte_pktmbuf_pool_create(temp1, arguments.nb_mbufs, 
+      	MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  
+    	RTE_LOG(INFO, DPDKCAP, "THIS IS secondary\n");
+  	}
+  	if (mbuf_pool[i] == NULL){
+    	rte_exit(EXIT_FAILURE, "Cannot create mbuf pool");
+    	RTE_LOG(INFO, DPDKCAP, "THIS IS %d\n", rte_eal_process_type());
+  	}
+
+  	//temp2="Ring for writing PRIMARY";
+  	//Initialize buffer for writing to disk
+  	while(str_replace(temp2,"portid",temp3));
+  	if(rte_eal_process_type() == RTE_PROC_PRIMARY){ 
+    	write_ring[i] = rte_ring_create(temp2,
+      	rte_align32pow2 (arguments.nb_mbufs), rte_socket_id(), 0);
+  	}
+
+  
+  	if(rte_eal_process_type() == RTE_PROC_SECONDARY){ 
+    	write_ring[i] = rte_ring_create(temp2,
+      	rte_align32pow2 (arguments.nb_mbufs), rte_socket_id(), 0);
+  }
+
+  	
+  }
 
 
-  //Initialize buffer for writing to disk
-  write_ring = rte_ring_create("Ring for writing",
-      rte_align32pow2 (arguments.nb_mbufs), rte_socket_id(), 0);
+
+
 
   /* Core index */
   core_index = rte_get_next_lcore(-1, 1, 0);
 
   /* Init stats list */
   cores_stats_write_list=
-    malloc(sizeof(struct core_write_stats)*arguments.num_w_cores);
+    malloc(sizeof(struct core_write_stats)*arguments.per_port_w_cores
+        *nb_ports);
   cores_stats_capture_list=
     malloc(sizeof(struct core_capture_stats)*arguments.per_port_c_cores
         *nb_ports);
 
   /* Init config lists */
   cores_config_write_list=
-    malloc(sizeof(struct core_write_config)*arguments.num_w_cores);
+    malloc(sizeof(struct core_write_config)*arguments.per_port_w_cores
+        *nb_ports);
   cores_config_capture_list=
     malloc(sizeof(struct core_capture_config)*arguments.per_port_c_cores
         *nb_ports);
 
   nb_lcores = 0;
   /* Writing cores */
-  for (i=0; i<arguments.num_w_cores; i++) {
+  for (i = 0; i < nb_ports; i++) {
+	for (j=0; j<arguments.per_port_w_cores; j++) {
+		struct core_write_config * config = &(cores_config_write_list[i*arguments.per_port_w_cores+j]);
+    	config->ring = write_ring[i];
+    	config->stop_condition = &should_stop;
+    	config->stats = &(cores_stats_write_list[i*arguments.per_port_w_cores+j]);
+    	config->output_file_template = arguments.output_file_template;
+    	config->no_compression = arguments.no_compression;
+    	config->snaplen = arguments.snaplen;
+    	config->rotate_seconds = arguments.rotate_seconds;
+    	config->file_size_limit = arguments.file_size_limit;
+    	config->port = i;
+    	config->pktlength = arguments.pktlength;
+
+    	//Launch writing core
+    	if (rte_eal_remote_launch((lcore_function_t *) write_core,
+          	config, core_index) < 0)
+      	rte_exit(EXIT_FAILURE, "Could not launch writing process on lcore %d.\n",
+          	core_index);
+
+    //Add the core to the list
+    lcoreid_list[nb_lcores] = core_index;
+    nb_lcores++;
+
+    core_index = rte_get_next_lcore(core_index, SKIP_MASTER, 0);
+	}
+  }
+
+/*  
+  for (i=0; i<arguments.per_port_w_cores*nb_ports; i++) {
 
     //Configure writing core
-    struct core_write_config * config = &(cores_config_write_list[i]);
-    config->ring = write_ring;
+    struct core_write_config * config = &(cores_config_write_list[i*arguments.per_port_w_cores+j]);
+    config->ring = write_ring[i];
     config->stop_condition = &should_stop;
     config->stats = &(cores_stats_write_list[i]);
     config->output_file_template = arguments.output_file_template;
@@ -560,17 +642,17 @@ int main(int argc, char *argv[]) {
 
     core_index = rte_get_next_lcore(core_index, SKIP_MASTER, 0);
   }
-
+*/
   /* For each port */
   for (i = 0; i < nb_ports; i++) {
     port_id = portlist[i];
-
+	
     /* Port init */
     int retval = port_init(
         port_id,
         arguments.per_port_c_cores,
         (num_rx_desc_matrix[i] != 0)?num_rx_desc_matrix[i]:RX_DESC_DEFAULT,
-        mbuf_pool);
+        mbuf_pool[i]);
     if (retval) {
       rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu8 "\n", port_id);
     }
@@ -580,7 +662,7 @@ int main(int argc, char *argv[]) {
       //Configure capture core
       struct core_capture_config * config =
         &(cores_config_capture_list[i*arguments.per_port_c_cores+j]);
-      config->ring = write_ring;
+      config->ring = write_ring[i];
       config->stop_condition = &should_stop;
       config->stats =
         &(cores_stats_capture_list[i*arguments.per_port_c_cores+j]);
@@ -608,9 +690,10 @@ int main(int argc, char *argv[]) {
 
   //Initialize statistics timer
   struct stats_data sd = {
-    .ring = write_ring,
+    .ring1 = write_ring[0],
+    .ring2 = write_ring[1],
     .cores_stats_write_list = cores_stats_write_list,
-    .cores_write_stats_list_size = arguments.num_w_cores,
+    .cores_write_stats_list_size = arguments.per_port_w_cores*nb_ports,
     .cores_stats_capture_list = cores_stats_capture_list,
     .cores_capture_stats_list_size = arguments.per_port_c_cores*nb_ports,
     .port_list=portlist,

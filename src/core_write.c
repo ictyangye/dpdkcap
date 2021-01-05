@@ -28,18 +28,23 @@
 static void format_from_template(
     char * filename,
     const char * template,
+    const int port_id,
     const int core_id,
     const int file_count,
     const struct timeval * file_start
     ) {
   char str_buf[DPDKCAP_OUTPUT_FILENAME_LENGTH];
+  //char str_real_buf[DPDKCAP_OUTPUT_FILENAME_LENGTH];
   //Change file name
   strncpy(filename, template,
       DPDKCAP_OUTPUT_FILENAME_LENGTH);
-  snprintf(str_buf, 50, "%02d", core_id);
-  while(str_replace(filename,"\%COREID",str_buf));
+  snprintf(str_buf, 50, "%01d", core_id);
+  //snprintf(str_real_buf, 50, "%01d", port_id);
+  while(str_replace(filename,"COREID",str_buf));
+  snprintf(str_buf, 50, "%01d", port_id);
+  while(str_replace(filename,"PORTID",str_buf));
   snprintf(str_buf, 50, "%03d", file_count);
-  while(str_replace(filename,"\%FCOUNT",str_buf));
+  while(str_replace(filename,"FCOUNT",str_buf));
   strncpy(str_buf, filename, DPDKCAP_OUTPUT_FILENAME_LENGTH);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
@@ -171,6 +176,7 @@ int write_core(const struct core_write_config * config) {
   unsigned int file_count = 0;
   uint64_t file_size = 0;
   struct timeval file_start;
+  unsigned int pkt_strip_len=config->pktlength;
 
   if(config->no_compression) {
     file_open_func  = (void*(*)(char*)) open_pcap;
@@ -185,7 +191,7 @@ int write_core(const struct core_write_config * config) {
 
   //Update filename
   format_from_template(file_name, config->output_file_template,
-      rte_lcore_id(), file_count, &file_start);
+      config->port, rte_lcore_id(), file_count, &file_start);
 
   //Init stats
   *(config->stats) = (struct core_write_stats) {
@@ -229,23 +235,12 @@ int write_core(const struct core_write_config * config) {
 
     //Get packets from the ring
 #if RTE_VERSION >= RTE_VERSION_NUM(17,5,0,16)
-    to_write = rte_ring_dequeue_bulk(config->ring, (void*) dequeued,
-        DPDKCAP_WRITE_BURST_SIZE, NULL);
-#else
-    to_write = rte_ring_dequeue_bulk(config->ring, (void*) dequeued,
-        DPDKCAP_WRITE_BURST_SIZE);
-#endif
-    if (likely(to_write!=0)) {
-      to_write = DPDKCAP_WRITE_BURST_SIZE;
-    } else {
-#if RTE_VERSION >= RTE_VERSION_NUM(17,5,0,16)
       to_write = rte_ring_dequeue_burst(config->ring, (void*)dequeued,
           DPDKCAP_WRITE_BURST_SIZE, NULL);
 #else
       to_write = rte_ring_dequeue_burst(config->ring, (void*)dequeued,
           DPDKCAP_WRITE_BURST_SIZE);
 #endif
-    }
 
     //Update stats
     config->stats->packets += to_write;
@@ -279,7 +274,7 @@ int write_core(const struct core_write_config * config) {
       //Open new file
       if(file_changed) {
         //Change file name
-        format_from_template(file_name, config->output_file_template,
+        format_from_template(file_name, config->output_file_template, config->port,
             rte_lcore_id(), file_count, &file_start);
 
         //Update stats
@@ -312,7 +307,7 @@ int write_core(const struct core_write_config * config) {
       //Write block header
       header.timestamp = (int32_t) tv.tv_sec;
       header.microseconds = (int32_t) tv.tv_usec;
-      header.packet_length = packet_length;
+      header.packet_length = MIN(packet_length,pkt_strip_len);
       header.packet_length_wire = wire_packet_length;
       written = file_write_func(write_buffer, &header,
           sizeof(struct pcap_packet_header));
@@ -323,10 +318,12 @@ int write_core(const struct core_write_config * config) {
       file_size += written;
 
       //Write content
-      remaining_bytes = packet_length;
+      //remaining_bytes = packet_length;
+      remaining_bytes = pkt_strip_len;
       compressed_length = 0;
       while (bufptr != NULL && remaining_bytes > 0) {
         bytes_to_write = MIN(rte_pktmbuf_data_len(bufptr), remaining_bytes);
+        //bytes_to_write = MIN(bytes_to_write,100);
         written = file_write_func(write_buffer,
             rte_pktmbuf_mtod(bufptr, void*),
             bytes_to_write);
@@ -344,10 +341,10 @@ int write_core(const struct core_write_config * config) {
       rte_pktmbuf_free(dequeued[i]);
 
       //Update stats
-      config->stats->bytes += packet_length;
+      config->stats->bytes += MIN(packet_length,pkt_strip_len);
       config->stats->compressed_bytes += compressed_length;
       config->stats->current_file_packets ++;
-      config->stats->current_file_bytes += packet_length;
+      config->stats->current_file_bytes += MIN(packet_length,pkt_strip_len);
       config->stats->current_file_compressed_bytes = file_size;
 
     }

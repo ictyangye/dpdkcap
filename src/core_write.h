@@ -17,6 +17,8 @@ struct core_write_config {
   unsigned int snaplen;
   unsigned long rotate_seconds;
   uint64_t file_size_limit;
+  int port;
+  unsigned int pktlength;
 };
 
 /* Statistics structure */
